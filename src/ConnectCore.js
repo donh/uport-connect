@@ -3,6 +3,7 @@ import { Credentials, ContractFactory } from 'uport'
 import MobileDetect from 'mobile-detect'
 import UportSubprovider from './uportSubprovider'
 const INFURA_ROPSTEN = 'https://ropsten.infura.io'
+import qs from 'qs'
 // Can use http provider from ethjs in the future.
 import HttpProvider from 'web3/lib/web3/httpprovider'
 import { isMNID, encode } from 'mnid'
@@ -280,20 +281,19 @@ class ConnectCore {
    *  Wraps up functionality to allow you to easily manage the entire req/res lifecycle
    *  with a request token created on you server and then fetching the response
    *  from your server. Given a token this will use the default uriHandler as usual
-   *  or will use a given uriHandler. If given a callbackUrl for the request, it will
-   *  poll for a response and return the body. You should form the callbackUrl as
-   *  necessary, likely including the pairId for the request as a param. If a callbackUrl
+   *  or will use a given uriHandler. If given a pollUrl for the request, it will
+   *  poll for a response and return the body. You should form the pollUrl as
+   *  necessary, likely including the pairId (of th challenge) for the request as a param. If a callbackUrl
    *  is not given, it will pass a uri to the uriHandler, but will not poll for a response.
    *  If not polling and using the default uriHandler, you will have to close the QR
    *  code yourself using QRUtil.closeQR().
+   * TODO  update explanation
    *
    *  @param    {Object}     txobj             transaction object
    *  @param    {String}     callbackUrl       application callback url
    *  @return   {Promise<Object, Error>}       A promise which resolves with a resonse object or rejects with an error.
    */
-  sendRequestToken({token, callbackUrl, uriHandler = this.uriHandler, pollingInterval = 2000}) {
-
-    // Create the uri with the token
+  sendRequestToken({token, pollUrl, postUrl,  uriHandler = this.uriHandler, pollingInterval = 1000}) {
     const uri = paramsToUri({to: 'me', requestToken: token})
 
     let isCancelled = false
@@ -305,40 +305,30 @@ class ConnectCore {
       : uriHandler(uri, cancel)
 
     // Polls only if given a callbackUrl
-    if (!callbackUrl) return
+    if (!pollUrl) return
 
-    const polling = () => {
-      new Promise((resolve, reject) => {
-        const cb = (err, res) => {
-          if  (err) reject(err)
-          resolve(res)
-        }
-
+    const polling = (url) => {
+      return new Promise((resolve, reject) => {
         let interval = setInterval(
           () => {
             nets({
-              uri: callbackUrl,
+              uri: url,
               json: true,
               method: 'GET',
               withCredentials: false,
               rejectUnauthorized: false
             },
             (err, res, body) => {
-              if (err) return cb(err)
+              if (err) reject(err)
 
               if (cancelled()) {
                 clearInterval(interval)
-                return cb(new Error('Request Cancelled'))
+                reject(new Error('Request Cancelled'))
               }
 
-              if (body.error) {
+              if (res.statusCode === 200) {
                 clearInterval(interval)
-                return cb(data.error)
-              }
-
-              if (body) {
-                clearInterval(interval)
-                return cb(null, body)
+                resolve(body)
               }
             })
           },
@@ -347,9 +337,46 @@ class ConnectCore {
       })
     }
 
+    // TODO modify topicFactory to make these functions resusable.
+    const waitForHashChange = () => {
+      return new Promise((resolve, reject) => {
+        window.onhashchange = () => {
+          if (window.location.hash) {
+            const params = qs.parse(window.location.hash.slice(1))
+            if (params['access_token']) {
+              window.onhashchange = function () {}
+              window.location.hash = ''
+              resolve(params)
+            } else if (params.error) {
+              window.onhashchange = function () {}
+              window.location.hash = ''
+              reject(params.error)
+            }
+          }
+        }
+      })
+    }
+
+    const postMobileResponse = (url, res) => {
+      return new Promise((resolve, reject) => {
+        nets({
+          uri: url,
+          body: res,
+          json: true,
+          method: 'POST',
+          withCredentials: false,
+          rejectUnauthorized: false
+        },
+        (err, res, body) => {
+          if(err) reject(err)
+          resolve(body)
+        })
+      })
+    }
+
     if (defaultUriHandler && !this.isOnMobile && this.closeUriHandler) {
       return new Promise((resolve, reject) => {
-        polling.then(res => {
+        polling(pollUrl).then(res => {
           this.closeUriHandler()
           resolve(res)
         }, error => {
@@ -357,7 +384,13 @@ class ConnectCore {
           reject(error)
         })
       })
-    } else { return polling }
+    } else if (this.isOnMobile) {
+        return waitForHashChange().then(res => postMobileResponse(postUrl, res))
+    } else {
+        const poll = polling(pollUrl)
+        poll.cancel = cancel
+        return poll
+    }
   }
 
   /**
@@ -391,7 +424,7 @@ class ConnectCore {
  *  @return   {Strings}              A uPort mobile URI
  *  @private
  */
-const paramsToUri = (params) => {
+function paramsToUri(params){
   let baseUri = 'me.uport'
 
   if (!params.to && !params.action) {
